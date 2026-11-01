@@ -71,17 +71,20 @@ const deleteCloudPdf = async (publicId) => {
   });
 };
 
+
 // CREATE ASSIGNMENT + OPTIONAL QUESTION PDF
 const createAssignment = async (req, res) => {
   let uploadedPublicId = null;
 
   try {
     const { id: classroomId } = req.params;
+
     const {
       title,
       description = "",
       dueDate,
       maxMarks,
+      weight = 100,
     } = req.body || {};
 
     if (!isValidId(classroomId)) {
@@ -144,6 +147,32 @@ const createAssignment = async (req, res) => {
       });
     }
 
+    // ML FEATURE: Assessment weight.
+    // Defaults to 100 if the frontend does not provide it.
+
+    if (
+      weight === null ||
+      (typeof weight === "string" && !weight.trim())
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Assessment weight must be a number between 0 and 100.",
+      });
+    }
+
+    const parsedWeight = Number(weight);
+
+    if (
+      !Number.isFinite(parsedWeight) ||
+      parsedWeight < 0 ||
+      parsedWeight > 100
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Assessment weight must be between 0 and 100.",
+      });
+    }
+
     if (
       req.file &&
       req.file.buffer.subarray(0, 5).toString() !== "%PDF-"
@@ -191,6 +220,10 @@ const createAssignment = async (req, res) => {
       teacher: req.user._id,
       dueDate: parsedDueDate,
       maxMarks: parsedMaxMarks,
+
+      // New ML field
+      weight: parsedWeight,
+
       ...(attachment ? { attachment } : {}),
     });
 
@@ -225,6 +258,7 @@ const createAssignment = async (req, res) => {
     });
   }
 };
+
 
 // GET CLASSROOM ASSIGNMENTS
 const getAssignments = async (req, res) => {
@@ -288,6 +322,7 @@ const getAssignments = async (req, res) => {
     });
   }
 };
+
 
 // VIEW/DOWNLOAD TEACHER'S ASSIGNMENT PDF
 const getAssignmentAttachment = async (req, res) => {
@@ -379,12 +414,14 @@ const getAssignmentAttachment = async (req, res) => {
   }
 };
 
+
 // SUBMIT ASSIGNMENT: TEXT, URL, PDF, OR A COMBINATION
 const submitAssignment = async (req, res) => {
   let uploadedPublicId = null;
 
   try {
     const { id: assignmentId } = req.params;
+
     const {
       answerText = "",
       submissionUrl = "",
@@ -480,12 +517,9 @@ const submitAssignment = async (req, res) => {
       });
     }
 
-    if (new Date() > assignment.dueDate) {
-      return res.status(400).json({
-        success: false,
-        message: "The assignment deadline has passed.",
-      });
-    }
+    // Late submissions are accepted.
+    // submittedAt is saved below. The ML controller compares
+    // submittedAt with assignment.dueDate to calculate late_submissions.
 
     let submission = await Submission.findOne({
       assignment: assignmentId,
@@ -523,7 +557,10 @@ const submitAssignment = async (req, res) => {
 
     submission.answerText = answerText.trim();
     submission.submissionUrl = submissionUrl.trim();
+
+    // Important for ML late-submission calculation.
     submission.submittedAt = new Date();
+
     submission.status = "submitted";
 
     await submission.save();
@@ -577,6 +614,7 @@ const submitAssignment = async (req, res) => {
     });
   }
 };
+
 
 // GET STUDENT SUBMISSIONS FOR AN ASSIGNMENT (TEACHER)
 const getAssignmentSubmissions = async (req, res) => {
@@ -640,7 +678,8 @@ const getAssignmentSubmissions = async (req, res) => {
   }
 };
 
- // VIEW/DOWNLOAD A STUDENT'S SUBMITTED PDF (TEACHER ONLY)
+
+// VIEW/DOWNLOAD A STUDENT'S SUBMITTED PDF (TEACHER ONLY)
 const getSubmissionAttachment = async (req, res) => {
   try {
     const { assignmentId, submissionId } = req.params;
@@ -655,7 +694,6 @@ const getSubmissionAttachment = async (req, res) => {
       });
     }
 
-    // Find assignment
     const assignment = await Assignment.findById(assignmentId);
 
     if (!assignment) {
@@ -665,7 +703,6 @@ const getSubmissionAttachment = async (req, res) => {
       });
     }
 
-    // Only the teacher who created this assignment can access submissions
     if (String(assignment.teacher) !== String(req.user._id)) {
       return res.status(403).json({
         success: false,
@@ -673,7 +710,6 @@ const getSubmissionAttachment = async (req, res) => {
       });
     }
 
-    // Ensure this submission belongs to this assignment
     const submission = await Submission.findOne({
       _id: submissionId,
       assignment: assignmentId,
@@ -696,7 +732,6 @@ const getSubmissionAttachment = async (req, res) => {
       });
     }
 
-    // Generate a short-lived URL for the authenticated Cloudinary PDF
     const signedUrl = cloudinary.utils.private_download_url(
       publicId,
       "pdf",
@@ -731,6 +766,7 @@ const getSubmissionAttachment = async (req, res) => {
     res.setHeader("Content-Length", buffer.length);
     res.setHeader("Cache-Control", "private, no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
+
     res.setHeader(
       "Content-Disposition",
       `inline; filename="${filename}"`
@@ -752,7 +788,11 @@ const getSubmissionAttachment = async (req, res) => {
 const gradeSubmission = async (req, res) => {
   try {
     const { assignmentId, submissionId } = req.params;
-    const { marksObtained, feedback = "" } = req.body || {};
+
+    const {
+      marksObtained,
+      feedback = "",
+    } = req.body || {};
 
     if (
       !isValidId(assignmentId) ||
@@ -853,6 +893,7 @@ const gradeSubmission = async (req, res) => {
   }
 };
 
+
 // STUDENT VIEWS THEIR SUBMISSION AND GRADE
 const getMySubmission = async (req, res) => {
   try {
@@ -916,6 +957,10 @@ const getMySubmission = async (req, res) => {
           title: assignment.title,
           dueDate: assignment.dueDate,
           maxMarks: assignment.maxMarks,
+
+          // New ML-related assignment field
+          weight: assignment.weight ?? 100,
+
           hasAttachment: Boolean(
             assignment.attachment?.cloudinaryPublicId
           ),
@@ -933,13 +978,14 @@ const getMySubmission = async (req, res) => {
   }
 };
 
+
 module.exports = {
   createAssignment,
   getAssignments,
   getAssignmentAttachment,
   submitAssignment,
   getAssignmentSubmissions,
-   getSubmissionAttachment,
+  getSubmissionAttachment,
   gradeSubmission,
   getMySubmission,
 };

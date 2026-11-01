@@ -1,585 +1,134 @@
-const mongoose = require("mongoose");
 
 const Classroom = require("../models/Classroom");
 const Assignment = require("../models/Assignment");
 const Submission = require("../models/Submission");
-const StudentRiskProfile = require("../models/StudentRiskProfile");
 
 const {
   predictBatch,
   ModelServiceError,
 } = require("../services/mlPredictionService");
 
-const REQUIRED_PROFILE_FIELDS = [
-  "studied_credits",
-  "date_registration",
-  "total_clicks",
-  "active_days",
-  "resources_visited",
-  "clicks_last_30_days",
-  "code_module",
-  "code_presentation",
-  "gender",
-  "region",
-  "highest_education",
-  "imd_band",
-  "age_band",
-  "disability",
-];
+const DAY_IN_MS = 24 * 60 * 60 * 1000;
+const MODEL_WINDOW_DAYS = 90;
 
-const ALLOWED_PROFILE_FIELDS = new Set([
-  ...REQUIRED_PROFILE_FIELDS,
-  "num_of_prev_attempts",
-  "date_unregistration",
-]);
-
-const CATEGORY_FIELDS = [
-  "code_module",
-  "code_presentation",
-  "gender",
-  "region",
-  "highest_education",
-  "imd_band",
-  "age_band",
-  "disability",
-];
-
-// These values match the accepted categories in the Python StudentData model.
-const ALLOWED_CATEGORIES = {
-  code_module: ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG"],
-
-  code_presentation: ["2013B", "2013J", "2014B", "2014J"],
-
-  gender: ["M", "F"],
-
-  region: [
-    "East Anglian Region",
-    "East Midlands Region",
-    "Ireland",
-    "London Region",
-    "North Region",
-    "North Western Region",
-    "Scotland",
-    "South East Region",
-    "South Region",
-    "South West Region",
-    "Wales",
-    "West Midlands Region",
-    "Yorkshire Region",
-  ],
-
-  highest_education: [
-    "No Formal quals",
-    "Lower Than A Level",
-    "A Level or Equivalent",
-    "HE Qualification",
-    "Post Graduate Qualification",
-  ],
-
-  imd_band: [
-    "0-10",
-    "10-20",
-    "20-30",
-    "30-40",
-    "40-50",
-    "50-60",
-    "60-70",
-    "70-80",
-    "80-90",
-    "90-100",
-    "unknown",
-  ],
-
-  age_band: ["0-35", "35-55", "55<="],
-
-  disability: ["Y", "N"],
-};
-
-const INTEGER_FIELDS = [
-  "num_of_prev_attempts",
-  "studied_credits",
-  "total_clicks",
-  "active_days",
-  "resources_visited",
-  "clicks_last_30_days",
-];
-
-const toProfileDocument = (body) => ({
-  numOfPrevAttempts: body.num_of_prev_attempts ?? 0,
-  studiedCredits: body.studied_credits,
-  dateRegistration: body.date_registration,
-  dateUnregistration: body.date_unregistration ?? null,
-
-  totalClicks: body.total_clicks,
-  activeDays: body.active_days,
-  resourcesVisited: body.resources_visited,
-  clicksLast30Days: body.clicks_last_30_days,
-
-  codeModule: body.code_module,
-  codePresentation: body.code_presentation,
-  gender: body.gender,
-  region: body.region,
-  highestEducation: body.highest_education,
-  imdBand: body.imd_band,
-  ageBand: body.age_band,
-  disability: body.disability,
-});
-
-// Keep the input feature names expected by the existing Python model.
-const toModelInput = (profile, metrics) => ({
-  num_of_prev_attempts: profile.numOfPrevAttempts ?? 0,
-  studied_credits: profile.studiedCredits,
-  date_registration: profile.dateRegistration,
-
-  num_assessments_done: metrics.numAssessmentsDone,
-  avg_score: metrics.averageScore ?? 0,
-  min_score: metrics.minimumScore ?? 0,
-  weighted_score: metrics.weightedScore ?? 0,
-  late_submissions: metrics.lateSubmissions,
-
-  total_clicks: profile.totalClicks,
-  active_days: profile.activeDays,
-  resources_visited: profile.resourcesVisited,
-  clicks_last_30_days: profile.clicksLast30Days,
-
-  code_module: profile.codeModule,
-  code_presentation: profile.codePresentation,
-  gender: profile.gender,
-  region: profile.region,
-  highest_education: profile.highestEducation,
-  imd_band: profile.imdBand,
-  age_band: profile.ageBand,
-  disability: profile.disability,
-});
-
-// Calculate metrics from existing assignments and submissions.
+// Calculate the six features required by the new XGBoost model.
 const calculateStudentMetrics = (
   assignments,
   studentSubmissions,
-  now = new Date()
+  courseStartDate
 ) => {
-  const assignmentById = new Map(
+  const courseStart = new Date(courseStartDate);
+  const day90End = new Date(
+    courseStart.getTime() + MODEL_WINDOW_DAYS * DAY_IN_MS
+  );
+
+  const assignmentMap = new Map(
     assignments.map((assignment) => [
       assignment._id.toString(),
       assignment,
     ])
   );
 
-  const submittedAssignmentIds = new Set();
-  const gradedPercentages = [];
+  const activeDays = new Set();
+  const scoredPercentages = [];
 
-  const recentCutoff7 = new Date(
-    now.getTime() - 7 * 24 * 60 * 60 * 1000
-  );
-
-  const recentCutoff30 = new Date(
-    now.getTime() - 30 * 24 * 60 * 60 * 1000
-  );
-
-  let weightedMarks = 0;
-  let weightedMaximum = 0;
   let lateSubmissions = 0;
-  let submissionsLast7Days = 0;
-  let submissionsLast30Days = 0;
-  let latestSubmissionAt = null;
+  let weightedScore = 0;
 
   for (const submission of studentSubmissions) {
-    const assignmentId = submission.assignment?._id
-      ? submission.assignment._id.toString()
-      : submission.assignment?.toString();
+    const submittedAt = new Date(submission.submittedAt);
 
-    const assignment = assignmentById.get(assignmentId);
+    // Only consider activity within the first 90 days.
+    if (
+      Number.isNaN(submittedAt.getTime()) ||
+      submittedAt < courseStart ||
+      submittedAt > day90End
+    ) {
+      continue;
+    }
+
+    // Record the calendar day on which the student was active.
+    activeDays.add(
+      submittedAt.toISOString().slice(0, 10)
+    );
+
+    const assignmentId = submission.assignment.toString();
+    const assignment = assignmentMap.get(assignmentId);
 
     if (!assignment) continue;
 
-    submittedAssignmentIds.add(assignmentId);
-
-    const submittedAt = submission.submittedAt
-      ? new Date(submission.submittedAt)
-      : null;
-
-    if (submittedAt && !Number.isNaN(submittedAt.getTime())) {
-      if (!latestSubmissionAt || submittedAt > latestSubmissionAt) {
-        latestSubmissionAt = submittedAt;
-      }
-
-      if (submittedAt >= recentCutoff7 && submittedAt <= now) {
-        submissionsLast7Days += 1;
-      }
-
-      if (submittedAt >= recentCutoff30 && submittedAt <= now) {
-        submissionsLast30Days += 1;
-      }
-
-      if (
-        assignment.dueDate &&
-        submittedAt > new Date(assignment.dueDate)
-      ) {
-        lateSubmissions += 1;
-      }
+    // Only assessments with a score contribute to score metrics.
+    if (
+      submission.status !== "graded" ||
+      submission.marksObtained === null ||
+      submission.marksObtained === undefined
+    ) {
+      continue;
     }
 
-    // Only graded submissions are used to calculate scores.
+    const marks = Number(submission.marksObtained);
+    const maxMarks = Number(assignment.maxMarks);
+    const weight = Number(assignment.weight ?? 100);
+
     if (
-      submission.status === "graded" &&
-      Number(assignment.maxMarks) > 0
+      !Number.isFinite(marks) ||
+      !Number.isFinite(maxMarks) ||
+      maxMarks <= 0 ||
+      marks < 0 ||
+      marks > maxMarks ||
+      !Number.isFinite(weight) ||
+      weight < 0
     ) {
-      const marks = Number(submission.marksObtained ?? 0);
-      const maxMarks = Number(assignment.maxMarks);
+      continue;
+    }
 
-      if (
-        !Number.isFinite(marks) ||
-        !Number.isFinite(maxMarks) ||
-        maxMarks <= 0
-      ) {
-        continue;
-      }
+    // Convert marks into percentage.
+    const score = (marks / maxMarks) * 100;
 
-      const percentage = Math.min(
-        100,
-        Math.max(0, (marks / maxMarks) * 100)
-      );
+    scoredPercentages.push(score);
 
-      gradedPercentages.push(percentage);
-      weightedMarks += marks;
-      weightedMaximum += maxMarks;
+    // Required formula:
+    // weighted_score = sum(score * assessment weight / 100)
+    weightedScore += (score * weight) / 100;
+
+    // Count only scored assessments submitted after their due date.
+    if (
+      assignment.dueDate &&
+      submittedAt > new Date(assignment.dueDate)
+    ) {
+      lateSubmissions++;
     }
   }
 
-  const averageScore = gradedPercentages.length
-    ? gradedPercentages.reduce((sum, score) => sum + score, 0) /
-      gradedPercentages.length
-    : null;
+  const numAssessmentsDone = scoredPercentages.length;
 
-  const minimumScore = gradedPercentages.length
-    ? Math.min(...gradedPercentages)
-    : null;
+  // No scored assessments: all five assessment metrics are zero.
+  if (numAssessmentsDone === 0) {
+    return {
+      num_assessments_done: 0,
+      avg_score: 0,
+      min_score: 0,
+      weighted_score: 0,
+      late_submissions: 0,
+      active_days: activeDays.size,
+    };
+  }
 
-  const weightedScore =
-    weightedMaximum > 0
-      ? Math.min(
-          100,
-          Math.max(0, (weightedMarks / weightedMaximum) * 100)
-        )
-      : null;
+  const avgScore =
+    scoredPercentages.reduce((sum, score) => sum + score, 0) /
+    numAssessmentsDone;
 
-  const overdueUnsubmittedAssignments = assignments.filter(
-    (assignment) => {
-      const dueDate = assignment.dueDate
-        ? new Date(assignment.dueDate)
-        : null;
+  const minScore = Math.min(...scoredPercentages);
 
-      return (
-        dueDate &&
-        !Number.isNaN(dueDate.getTime()) &&
-        dueDate < now &&
-        !submittedAssignmentIds.has(assignment._id.toString())
-      );
-    }
-  ).length;
-
-  const submittedAssessments = submittedAssignmentIds.size;
-  const gradedAssessments = gradedPercentages.length;
-
+  // Exactly six numeric fields expected by the Python API.
   return {
-    // Preserved for compatibility with the current Python model.
-    numAssessmentsDone: submittedAssessments,
-
-    submittedAssessments,
-    gradedAssessments,
-
-    ungradedAssessments: Math.max(
-      0,
-      submittedAssessments - gradedAssessments
-    ),
-
-    pendingAssessments: Math.max(
-      0,
-      assignments.length - submittedAssessments
-    ),
-
-    overdueUnsubmittedAssignments,
-    totalAssignments: assignments.length,
-
-    averageScore:
-      averageScore === null
-        ? null
-        : Number(averageScore.toFixed(2)),
-
-    minimumScore:
-      minimumScore === null
-        ? null
-        : Number(minimumScore.toFixed(2)),
-
-    weightedScore:
-      weightedScore === null
-        ? null
-        : Number(weightedScore.toFixed(2)),
-
-    lateSubmissions,
-    submissionsLast7Days,
-    submissionsLast30Days,
-
-    latestSubmissionAt: latestSubmissionAt
-      ? latestSubmissionAt.toISOString()
-      : null,
-
-    scoreDataAvailable: gradedAssessments > 0,
+    num_assessments_done: numAssessmentsDone,
+    avg_score: Number(avgScore.toFixed(2)),
+    min_score: Number(minScore.toFixed(2)),
+    weighted_score: Number(weightedScore.toFixed(2)),
+    late_submissions: lateSubmissions,
+    active_days: activeDays.size,
   };
-};
-
-const isValidObjectId = (value) =>
-  mongoose.isValidObjectId(value);
-
-const getOwnedClassroom = async (classroomId, teacherId) => {
-  if (!isValidObjectId(classroomId)) {
-    return {
-      error: "Invalid classroom ID.",
-      status: 400,
-    };
-  }
-
-  const classroom = await Classroom.findOne({
-    _id: classroomId,
-    teacher: teacherId,
-  }).populate("students", "name email");
-
-  if (!classroom) {
-    return {
-      error: "Classroom not found or you are not its teacher.",
-      status: 404,
-    };
-  }
-
-  return { classroom };
-};
-
-// PUT /api/analytics/teacher/classrooms/:id/students/:studentId/risk-profile
-const upsertStudentRiskProfile = async (req, res) => {
-  try {
-    const { id: classroomId, studentId } = req.params;
-
-    const ownership = await getOwnedClassroom(
-      classroomId,
-      req.user._id
-    );
-
-    if (ownership.error) {
-      return res.status(ownership.status).json({
-        success: false,
-        message: ownership.error,
-      });
-    }
-
-    if (!isValidObjectId(studentId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid student ID.",
-      });
-    }
-
-    const studentIsEnrolled = ownership.classroom.students.some(
-      (student) => student._id.toString() === studentId
-    );
-
-    if (!studentIsEnrolled) {
-      return res.status(404).json({
-        success: false,
-        message: "Student is not enrolled in this classroom.",
-      });
-    }
-
-    const body =
-      req.body &&
-      typeof req.body === "object" &&
-      !Array.isArray(req.body)
-        ? { ...req.body }
-        : null;
-
-    if (!body) {
-      return res.status(400).json({
-        success: false,
-        message: "A JSON object is required.",
-      });
-    }
-
-    const unexpectedFields = Object.keys(body).filter(
-      (field) => !ALLOWED_PROFILE_FIELDS.has(field)
-    );
-
-    if (unexpectedFields.length) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Unexpected fields provided. Assessment metrics are derived from ClassSphere submissions.",
-        fields: unexpectedFields,
-      });
-    }
-
-    const missingFields = REQUIRED_PROFILE_FIELDS.filter(
-      (field) =>
-        body[field] === undefined ||
-        body[field] === null ||
-        body[field] === ""
-    );
-
-    if (missingFields.length) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Complete the required model context and activity fields before saving the risk profile.",
-        missingFields,
-      });
-    }
-
-    // Normalize the optional percent sign accepted by the Python API.
-    if (typeof body.imd_band === "string") {
-      body.imd_band = body.imd_band.replace(/%/g, "").trim();
-    }
-
-    for (const field of INTEGER_FIELDS) {
-      if (
-        body[field] !== undefined &&
-        (!Number.isInteger(body[field]) || body[field] < 0)
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: `${field} must be a non-negative integer.`,
-        });
-      }
-    }
-
-    if (!Number.isFinite(body.date_registration)) {
-      return res.status(400).json({
-        success: false,
-        message: "date_registration must be a finite number.",
-      });
-    }
-
-    if (
-      body.date_unregistration !== undefined &&
-      body.date_unregistration !== null &&
-      !Number.isFinite(body.date_unregistration)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "date_unregistration must be a finite number or null.",
-      });
-    }
-
-    if (
-      body.date_unregistration !== undefined &&
-      body.date_unregistration !== null &&
-      body.date_unregistration < body.date_registration
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "date_unregistration cannot be earlier than date_registration.",
-      });
-    }
-
-    for (const field of CATEGORY_FIELDS) {
-      if (typeof body[field] !== "string") {
-        return res.status(400).json({
-          success: false,
-          message: `Invalid value for ${field}.`,
-          allowedValues: ALLOWED_CATEGORIES[field],
-        });
-      }
-
-      const value = body[field].trim();
-
-      if (!ALLOWED_CATEGORIES[field].includes(value)) {
-        return res.status(400).json({
-          success: false,
-          message: `Invalid value for ${field}.`,
-          allowedValues: ALLOWED_CATEGORIES[field],
-        });
-      }
-
-      body[field] = value;
-    }
-
-    if (body.clicks_last_30_days > body.total_clicks) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "clicks_last_30_days cannot exceed total_clicks.",
-      });
-    }
-
-    if (body.active_days > 90) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "active_days cannot exceed the model's 90-day activity window.",
-      });
-    }
-
-    const profileValues = toProfileDocument(body);
-
-    let profile = await StudentRiskProfile.findOne({
-      student: studentId,
-      classroom: classroomId,
-    });
-
-    if (!profile) {
-      profile = new StudentRiskProfile({
-        student: studentId,
-        classroom: classroomId,
-      });
-    }
-
-    Object.assign(profile, profileValues, {
-      updatedBy: req.user._id,
-    });
-
-    try {
-      await profile.save();
-    } catch (error) {
-      if (
-        error.name === "ValidationError" ||
-        error.name === "CastError"
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "One or more risk profile fields use a value that the model does not accept.",
-          details: Object.values(error.errors || {}).map(
-            (item) => ({
-              field: item.path,
-              message: item.message,
-            })
-          ),
-        });
-      }
-
-      throw error;
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: "Student risk profile saved.",
-      data: {
-        studentId,
-        classroomId,
-        profileConfigured: true,
-        updatedAt: profile.updatedAt,
-      },
-    });
-  } catch (error) {
-    console.error(
-      "Save student risk profile error:",
-      error.message
-    );
-
-    return res.status(500).json({
-      success: false,
-      message: "Internal server error.",
-    });
-  }
 };
 
 // GET /api/analytics/teacher/classrooms/:id/risk-predictions
@@ -587,19 +136,46 @@ const getClassroomRiskPredictions = async (req, res) => {
   try {
     const { id: classroomId } = req.params;
 
-    const ownership = await getOwnedClassroom(
-      classroomId,
-      req.user._id
-    );
-
-    if (ownership.error) {
-      return res.status(ownership.status).json({
+    // Check classroom ID.
+    if (!require("mongoose").isValidObjectId(classroomId)) {
+      return res.status(400).json({
         success: false,
-        message: ownership.error,
+        message: "Invalid classroom ID.",
       });
     }
 
-    const { classroom } = ownership;
+    // Verify that the logged-in teacher owns this classroom.
+    const classroom = await Classroom.findOne({
+      _id: classroomId,
+      teacher: req.user._id,
+    }).populate("students", "name email");
+
+    if (!classroom) {
+      return res.status(404).json({
+        success: false,
+        message: "Classroom not found or you are not its teacher.",
+      });
+    }
+
+    const courseStartDate = new Date(classroom.createdAt);
+
+    const predictionEligibleFrom = new Date(
+      courseStartDate.getTime() + MODEL_WINDOW_DAYS * DAY_IN_MS
+    );
+
+    // The model must not be used before day 90.
+    if (new Date() < predictionEligibleFrom) {
+      return res.status(409).json({
+        success: false,
+        code: "MODEL_WINDOW_NOT_REACHED",
+        message:
+          "Risk predictions are available only from day 90 of the course.",
+        data: {
+          courseStartDate,
+          predictionEligibleFrom,
+        },
+      });
+    }
 
     if (classroom.students.length === 0) {
       return res.status(200).json({
@@ -616,9 +192,10 @@ const getClassroomRiskPredictions = async (req, res) => {
       });
     }
 
+    // Fetch classroom assessments.
     const assignments = await Assignment.find({
       classroom: classroomId,
-    }).select("_id maxMarks dueDate");
+    }).select("_id maxMarks weight dueDate");
 
     const assignmentIds = assignments.map(
       (assignment) => assignment._id
@@ -628,145 +205,117 @@ const getClassroomRiskPredictions = async (req, res) => {
       (student) => student._id
     );
 
+    // Fetch submissions of all enrolled students.
     const submissions = assignmentIds.length
       ? await Submission.find({
           assignment: { $in: assignmentIds },
           student: { $in: studentIds },
         }).select(
-          "student assignment status marksObtained submittedAt gradedAt"
+          "student assignment status marksObtained submittedAt"
         )
       : [];
 
-    const profiles = await StudentRiskProfile.find({
-      classroom: classroomId,
-      student: { $in: studentIds },
-    });
-
-    const profileMap = new Map(
-      profiles.map((profile) => [
-        profile.student.toString(),
-        profile,
-      ])
-    );
-
+    // Group submissions by student.
     const submissionsByStudent = new Map(
       studentIds.map((id) => [id.toString(), []])
     );
 
     for (const submission of submissions) {
-      const list = submissionsByStudent.get(
+      const studentSubmissions = submissionsByStudent.get(
         submission.student.toString()
       );
 
-      if (list) {
-        list.push(submission);
+      if (studentSubmissions) {
+        studentSubmissions.push(submission);
       }
     }
 
-    const studentsWithProfiles = [];
-
-    const studentResponses = classroom.students.map((student) => {
-      const studentId = student._id.toString();
-      const profile = profileMap.get(studentId);
-
+    // Prepare exactly six model inputs for every student.
+    const studentsWithMetrics = classroom.students.map((student) => {
       const metrics = calculateStudentMetrics(
         assignments,
-        submissionsByStudent.get(studentId) || []
+        submissionsByStudent.get(student._id.toString()) || [],
+        courseStartDate
       );
 
-      if (!profile) {
-        return {
-          student: {
-            id: student._id,
-            name: student.name,
-            email: student.email,
-          },
-          status: "profile_required",
-          message:
-            "Configure the required ML model context and activity fields for this student before prediction.",
-          profileEndpoint:
-            `/api/analytics/teacher/classrooms/${classroomId}/students/${studentId}/risk-profile`,
-          performanceMetrics: metrics,
-        };
-      }
-
-      studentsWithProfiles.push({
+      return {
         student,
-        profile,
         metrics,
-        modelInput: toModelInput(profile, metrics),
-      });
-
-      return null;
+      };
     });
 
     let predictions = [];
 
-    if (studentsWithProfiles.length > 0) {
-      try {
-        predictions = await predictBatch(
-          studentsWithProfiles.map((item) => item.modelInput)
-        );
-      } catch (error) {
-        if (error instanceof ModelServiceError) {
-          return res.status(error.statusCode).json({
-            success: false,
-            code: error.code,
-            message: error.message,
-          });
-        }
-
-        throw error;
+    try {
+      predictions = await predictBatch(
+        studentsWithMetrics.map((item) => item.metrics)
+      );
+    } catch (error) {
+      if (error instanceof ModelServiceError) {
+        return res.status(error.statusCode).json({
+          success: false,
+          code: error.code,
+          message: error.message,
+        });
       }
+
+      throw error;
     }
 
-    const predictionByStudent = new Map();
+    // Match each prediction with the correct student.
+    const students = studentsWithMetrics.map((item, index) => ({
+      student: {
+        id: item.student._id,
+        name: item.student.name,
+        email: item.student.email,
+      },
 
-    studentsWithProfiles.forEach((item, index) => {
-      predictionByStudent.set(
-        item.student._id.toString(),
-        {
-          student: {
-            id: item.student._id,
-            name: item.student.name,
-            email: item.student.email,
-          },
-          status: "predicted",
-          prediction: predictions[index],
-          performanceMetrics: item.metrics,
-          predictionCaveat: item.metrics.scoreDataAvailable
-            ? null
-            : "No graded assignments yet; score-based metrics are unavailable and returned as null.",
-        }
-      );
-    });
+      status: "predicted",
 
-    const students = classroom.students.map(
-      (student, index) =>
-        predictionByStudent.get(student._id.toString()) ||
-        studentResponses[index]
-    );
+      inputFeatures: item.metrics,
 
-    const predictedStudents = students.filter(
-      (student) => student.status === "predicted"
+      prediction: predictions[index],
+    }));
+
+    const highRiskStudents = students.filter(
+      (item) => item.prediction.risk_level === "High"
+    ).length;
+
+    const atRiskStudents = students.filter(
+      (item) => item.prediction.at_risk
     ).length;
 
     return res.status(200).json({
       success: true,
+
       data: {
         classroom: {
           id: classroom._id,
           name: classroom.name,
         },
+
+        model: {
+          name: "XGBoost",
+          target: "Fail or Withdrawn",
+          observationWindowDays: 90,
+          threshold: 0.35,
+        },
+
+        courseStartDate,
+        predictionEligibleFrom,
+
         totalStudents: students.length,
-        predictedStudents,
+        predictedStudents: predictions.length,
+        atRiskStudents,
+        highRiskStudents,
+
         students,
 
         disclaimer:
           "Risk scores are model estimates for decision support only, not a diagnosis or guarantee. Do not use them as the sole basis for decisions affecting a student.",
 
-        modelWindowNote:
-          "The supplied model was designed around course activity up to day 90. Ensure saved activity values use a compatible time window before interpreting predictions.",
+        activityDataNote:
+          "active_days is calculated from distinct assignment submission dates. Other platform activities are not included because ClassSphere currently has no general activity log.",
       },
     });
   } catch (error) {
@@ -783,6 +332,6 @@ const getClassroomRiskPredictions = async (req, res) => {
 };
 
 module.exports = {
-  upsertStudentRiskProfile,
+  calculateStudentMetrics,
   getClassroomRiskPredictions,
 };
