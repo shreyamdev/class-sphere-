@@ -11,7 +11,11 @@ const Submission = require("../src/models/Submission");
 const Announcement = require("../src/models/Announcement");
 const Notification = require("../src/models/Notification");
 const StudyMaterial = require("../src/models/StudyMaterial");
-const StudentRiskProfile = require("../src/models/StudentRiskProfile");
+const Quiz = require("../src/models/Quiz");
+const QuizAttempt = require("../src/models/QuizAttempt");
+const Doubt = require("../src/models/Doubt");
+const ActivityEvent = require("../src/models/ActivityEvent");
+const cloudinary = require("../src/config/cloudinary");
 
 const DEMO_PASSWORD = "Demo@12345";
 const DAY = 24 * 60 * 60 * 1000;
@@ -39,14 +43,40 @@ async function seedDemo() {
 
     console.log(`Connected to existing database: ${actualDbName}`);
 
+    // Remove old authenticated PDFs before clearing their MongoDB references.
+    const [oldAssignments, oldSubmissions, oldMaterials] = await Promise.all([
+      Assignment.find().select("attachment.cloudinaryPublicId").lean(),
+      Submission.find().select("attachment.cloudinaryPublicId").lean(),
+      StudyMaterial.find().select("cloudinaryPublicId").lean(),
+    ]);
+    const oldAssetIds = [...new Set([
+      ...oldAssignments.map((item) => item.attachment?.cloudinaryPublicId),
+      ...oldSubmissions.map((item) => item.attachment?.cloudinaryPublicId),
+      ...oldMaterials.map((item) => item.cloudinaryPublicId),
+    ].filter(Boolean))];
+
+    for (const publicId of oldAssetIds) {
+      const result = await cloudinary.uploader.destroy(publicId, {
+        resource_type: "raw",
+        type: "authenticated",
+        invalidate: true,
+      });
+      if (result.result !== "ok" && result.result !== "not found") {
+        throw new Error(`Could not remove existing Cloudinary asset ${publicId}`);
+      }
+    }
+
     // Clear dependent records first.
     const modelsToClear = [
       Notification,
+      QuizAttempt,
+      Quiz,
+      Doubt,
+      ActivityEvent,
       Submission,
       Announcement,
       Assignment,
       StudyMaterial,
-      StudentRiskProfile,
       Classroom,
       User,
     ];
@@ -113,23 +143,27 @@ async function seedDemo() {
       { name: "Software Engineering", subject: "Software Engineering", section: "Semester 4 - B", teacher: 2, students: [2, 3, 6, 7, 11, 12, 14], code: "CSSE2607" },
     ];
 
+    const now = new Date();
+    // Demo courses are 120 days old so predictions can be exercised immediately.
+    const demoCourseStart = new Date(now.getTime() - 120 * DAY);
+
     const classrooms = await Classroom.insertMany(
-      classroomSpecs.map((spec) => ({
+      classroomSpecs.map((spec, index) => ({
         name: spec.name,
         description: `ClassSphere demo classroom for ${spec.name}. Explore announcements, assignments, submissions, and learning progress.`,
         subject: spec.subject,
         semesterSection: spec.section,
         classCode: spec.code,
+        courseStartDate: new Date(demoCourseStart.getTime() - index * DAY),
         teacher: teachers[spec.teacher]._id,
         students: spec.students.map((i) => students[i]._id),
       }))
     );
 
-    const now = new Date();
     const assignmentTemplates = [
-      { title: "Concept Check", description: "Answer core concept questions and explain your reasoning.", maxMarks: 20, dueInDays: 5 },
-      { title: "Practical Exercise", description: "Complete practical tasks and submit your solution.", maxMarks: 30, dueInDays: 9 },
-      { title: "Mini Project", description: "Build a small project demonstrating the topics covered.", maxMarks: 50, dueInDays: 14 },
+      { title: "Concept Check", description: "Answer core concept questions and explain your reasoning.", maxMarks: 20, dueInCourseDays: 20, weight: 20 },
+      { title: "Practical Exercise", description: "Complete practical tasks and submit your solution.", maxMarks: 30, dueInCourseDays: 45, weight: 30 },
+      { title: "Mini Project", description: "Build a small project demonstrating the topics covered.", maxMarks: 50, dueInCourseDays: 70, weight: 50 },
     ];
 
     const assignmentsToCreate = [];
@@ -141,8 +175,12 @@ async function seedDemo() {
           description: template.description,
           classroom: classroom._id,
           teacher: teachers[classroomSpecs[i].teacher]._id,
-          dueDate: new Date(now.getTime() + (template.dueInDays + i % 3) * DAY),
+          dueDate: new Date(
+            classroom.courseStartDate.getTime() +
+            (template.dueInCourseDays + (i % 3)) * DAY
+          ),
           maxMarks: template.maxMarks,
+          weight: template.weight,
         });
       });
     });
@@ -167,7 +205,10 @@ async function seedDemo() {
           assignment: assignment._id,
           student: studentId,
           answerText: `Demo response for ${assignment.title}. I completed the required concepts and included examples.`,
-          submittedAt: new Date(now.getTime() - ((studentIndex % 6) + 1) * DAY),
+          submittedAt: new Date(
+            assignment.dueDate.getTime() +
+            (((studentIndex + assignmentIndex) % 5) - 2) * DAY
+          ),
           status: graded ? "graded" : "submitted",
           marksObtained: graded ? marks : null,
           feedback: graded
@@ -225,55 +266,64 @@ async function seedDemo() {
 
     await Notification.insertMany(notificationsToCreate);
 
-    // Synthetic ML profiles for feature demonstration only.
-    const codeModules = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG"];
-    const codePresentations = ["2013B", "2013J", "2014B", "2014J"];
-    const regions = [
-      "East Anglian Region", "East Midlands Region", "Ireland",
-      "London Region", "North Region", "North Western Region",
-      "Scotland", "South East Region", "South Region",
-      "South West Region", "Wales", "West Midlands Region",
-      "Yorkshire Region",
+    // Seed real activity events used by the six-feature ML model.
+    // The event dates are within each classroom's first 90 course days.
+    const activityEvents = [];
+    const activityTypes = [
+      "classroom_view",
+      "assignment_list_view",
+      "quiz_list_view",
+      "announcement_list_view",
+      "doubt_list_view",
+      "resource_list_view",
+      "resource_download",
+      "doubt_created",
+      "doubt_reply",
     ];
-    const educationLevels = [
-      "No Formal quals", "Lower Than A Level",
-      "A Level or Equivalent", "HE Qualification",
-      "Post Graduate Qualification",
-    ];
-    const imdBands = [
-      "0-10", "10-20", "20-30", "30-40", "40-50",
-      "50-60", "60-70", "70-80", "80-90", "90-100", "unknown",
-    ];
-    const ageBands = ["0-35", "35-55", "55<="];
-    const riskProfiles = [];
 
     classrooms.forEach((classroom, classIndex) => {
       classroom.students.forEach((studentId, studentIndex) => {
-        riskProfiles.push({
-          student: studentId,
-          classroom: classroom._id,
-          numOfPrevAttempts: (studentIndex + classIndex) % 3,
-          studiedCredits: 30 + ((studentIndex + classIndex) % 5) * 10,
-          dateRegistration: 202510 + ((studentIndex + classIndex) % 8),
-          dateUnregistration: null,
-          totalClicks: 80 + studentIndex * 17 + classIndex * 9,
-          activeDays: 8 + ((studentIndex + classIndex) % 18),
-          resourcesVisited: 4 + ((studentIndex * 2 + classIndex) % 12),
-          clicksLast30Days: 15 + ((studentIndex * 7 + classIndex * 3) % 60),
-          codeModule: codeModules[(studentIndex + classIndex) % codeModules.length],
-          codePresentation: codePresentations[(studentIndex + classIndex) % codePresentations.length],
-          gender: (studentIndex + classIndex) % 2 === 0 ? "F" : "M",
-          region: regions[(studentIndex + classIndex) % regions.length],
-          highestEducation: educationLevels[(studentIndex + classIndex) % educationLevels.length],
-          imdBand: imdBands[(studentIndex + classIndex) % imdBands.length],
-          ageBand: ageBands[(studentIndex + classIndex) % ageBands.length],
-          disability: (studentIndex + classIndex) % 9 === 0 ? "Y" : "N",
-          updatedBy: teachers[classIndex % teachers.length]._id,
+        const activityOffsets = [
+          3 + (studentIndex % 3),
+          11 + (studentIndex % 4),
+          22 + (classIndex % 5),
+          36 + (studentIndex % 6),
+          51 + (classIndex % 7),
+          68 + (studentIndex % 5),
+          84 - (classIndex % 4),
+        ];
+
+        activityOffsets.forEach((dayOffset, eventIndex) => {
+          activityEvents.push({
+            student: studentId,
+            classroom: classroom._id,
+            eventType: activityTypes[eventIndex % activityTypes.length],
+            occurredAt: new Date(
+              classroom.courseStartDate.getTime() +
+              dayOffset * DAY +
+              (eventIndex + 1) * 60 * 1000
+            ),
+          });
         });
       });
     });
 
-    await StudentRiskProfile.insertMany(riskProfiles);
+    // Also create explicit activity events for the synthetic assignment submissions.
+    submissionsToCreate.forEach((submission) => {
+      const assignment = assignments.find((item) =>
+        item._id.equals(submission.assignment)
+      );
+      if (!assignment) return;
+      activityEvents.push({
+        student: submission.student,
+        classroom: assignment.classroom,
+        eventType: "assignment_submission",
+        sourceId: assignment._id,
+        occurredAt: submission.submittedAt,
+      });
+    });
+
+    await ActivityEvent.insertMany(activityEvents);
 
     // Leave StudyMaterial empty for actual teacher uploads.
     console.log("\nSEED COMPLETE");
@@ -285,7 +335,7 @@ async function seedDemo() {
     console.log(`Submissions: ${submissionsToCreate.length}`);
     console.log(`Announcements: ${announcements.length}`);
     console.log(`Notifications: ${notificationsToCreate.length}`);
-    console.log(`Synthetic risk profiles: ${riskProfiles.length}`);
+    console.log(`Activity events: ${activityEvents.length}`);
     console.log("Study materials: 0");
     console.log(`Demo password for all accounts: ${DEMO_PASSWORD}`);
 

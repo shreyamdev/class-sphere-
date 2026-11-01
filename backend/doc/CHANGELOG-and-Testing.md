@@ -1,36 +1,46 @@
 # Changelog and Testing
 
-## ML and AI service integration update
+## Current backend updates
 
-- Kept the existing Node.js/Express API, authentication, classroom, assignment, study-material, announcement, notification and analytics routes.
-- Kept the existing teacher-only at-risk prediction integration and documented its required model profile fields.
-- Added authenticated PDF notes summarization and flashcard generation through `AI_SERVICE_URL`.
-- Added teacher-only quiz generation from topic/study text and from PDF through `QUIZ_SERVICE_URL`; quiz endpoints are teacher-only because responses contain correct answers.
-- Added service URL validation, HTTPS enforcement for non-local URLs, 120-second timeouts, JSON response validation and consistent upstream errors.
-- Added `.env.example` and `doc/AI-Features.md`. No live `.env` or API keys are included.
-- No new npm dependencies were added; the project already includes `multer` and requires Node.js 18+ for built-in `fetch`, `FormData`, and `Blob`.
+- Replaced the old risk-profile prediction input with the six-field XGBoost contract.
+- Added `Classroom.courseStartDate` and a repeatable migration from legacy `createdAt` values.
+- Added `ActivityEvent` tracking for meaningful student learning actions.
+- Calculates activity days from course day 0 through day 90 inclusive.
+- Adds `Assignment.weight` and retains late submission timestamps for the model's late-submission feature.
+- Adds API-key header support for the separate FastAPI ML service.
+- Removes all `StudentRiskProfile` model workflow references.
+- Adds Cloudinary cleanup for assignment PDFs, student submission PDFs, and study-material PDFs when deleting a classroom.
+- Adds a dry-run-by-default orphan audit script.
+- Adds student quiz attempt review with their selected answer, correct answer, and correctness for each question.
 
-## Automated checks run for this archive
+## Automated tests
 
-- `npm test`: 6 passing tests, 0 failures.
-- `node --check` run for every JavaScript file under `src/`: passed.
-- These checks cover client behavior and syntax; they do not prove that the remote summarizer/quiz services are deployed or that their environment URLs are configured correctly.
+Run:
 
-## Before deployment
+```bash
+npm test
+```
 
-1. Keep the existing local `.env` unchanged and add the three service URLs if missing.
-2. In the Node.js backend Render service, configure `MODEL_API_URL`, `AI_SERVICE_URL`, and `QUIZ_SERVICE_URL` with the real public base URLs.
-3. Deploy the backend and test with a real teacher/student access token.
-4. Verify the quiz service's configured Gemini model ID is supported by its API key, as noted in the AI Quiz Generator guide.
-5. Use representative and appropriate student data for ML risk predictions. Model estimates must not be the sole basis for high-impact decisions.
+Current targeted tests include:
 
-## 2026-10-28 — Authentication, data integrity, ML and quiz integration hardening
-- Password login now requires the selected portal role and rejects mismatches with `403 ROLE_MISMATCH` without issuing tokens.
-- Google login requires a selected role and rejects a mismatch for an existing account; stored roles are never changed during login.
-- Classroom deletion now also removes classroom quizzes, quiz attempts, risk profiles, and doubts.
-- Added a dry-run-first orphan/reference audit script (`npm run audit:orphans`; add `-- --apply` only after backup and reviewing the report).
-- Risk prediction payload now follows the supplied ML deployment guide's 20 supported input fields and omits `date_unregistration` from the external model request.
-- Quiz service client reports non-JSON upstream errors more clearly and rejects `QUIZ_SERVICE_URL` values containing endpoint paths.
-- Fixed production CORS origin's trailing slash mismatch.
-- Added role and quiz integration tests; all 10 automated tests pass locally.
-- Live Render services and production MongoDB were not modified or tested by this patch.
+- AI service client URL, payload, response, and error handling.
+- Authentication role enforcement.
+- ML service input contract, key header, response shape, threshold consistency, and batch result count.
+- ML metric calculations for score aggregation, late submissions, no-score defaults, and day-0/day-90 boundaries.
+- Quiz review construction for correct, incorrect, and unanswered questions.
+
+## Manual integration tests
+
+1. Start Express with a reachable MongoDB and complete `.env`.
+2. Create a classroom with an explicit `courseStartDate`.
+3. Record student assignment, quiz, resource, and doubt activities.
+4. Verify a prediction before day 90 returns `409 MODEL_WINDOW_NOT_REACHED`.
+5. Verify a prediction on/after day 90 calls the protected FastAPI endpoint and returns the six input features.
+6. Submit a quiz and verify the immediate `review` response shows selected and correct answers.
+7. Fetch `/api/quizzes/student/attempts/:attemptId/review` as the owner and as another student; only the owner should succeed.
+8. Delete a test classroom and verify its Cloudinary PDFs and MongoDB dependent records are removed.
+9. Run the orphan audit without `--apply`; verify no changes are made.
+
+## Limitations to verify with the ML owner
+
+The model guide provides the weighted-score formula but does not define the exact ClassSphere assignment-weight scale. The backend currently treats weight as a percentage from 0 to 100. Confirm this against the notebook before using predictions for real student-support decisions.

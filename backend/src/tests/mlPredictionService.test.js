@@ -9,6 +9,7 @@ const {
 
 const originalFetch = global.fetch;
 const originalModelUrl = process.env.MODEL_API_URL;
+const originalModelApiKey = process.env.MODEL_API_KEY;
 
 const validStudent = {
   num_assessments_done: 2,
@@ -33,10 +34,16 @@ test.after(() => {
   } else {
     process.env.MODEL_API_URL = originalModelUrl;
   }
+  if (originalModelApiKey === undefined) {
+    delete process.env.MODEL_API_KEY;
+  } else {
+    process.env.MODEL_API_KEY = originalModelApiKey;
+  }
 });
 
 test("predictBatch sends six-feature inputs to /predict-batch", async () => {
   process.env.MODEL_API_URL = "https://ml-service.example";
+  process.env.MODEL_API_KEY = "test-model-api-key-which-is-long-enough-123456789";
 
   let receivedUrl;
   let receivedOptions;
@@ -87,6 +94,10 @@ test("predictBatch sends six-feature inputs to /predict-batch", async () => {
     receivedOptions.headers["Content-Type"],
     "application/json"
   );
+  assert.equal(
+    receivedOptions.headers["X-Model-API-Key"],
+    "test-model-api-key-which-is-long-enough-123456789"
+  );
 
   assert.deepEqual(
     JSON.parse(receivedOptions.body),
@@ -98,6 +109,7 @@ test("predictBatch sends six-feature inputs to /predict-batch", async () => {
 
 test("predictBatch rejects extra ML input fields", async () => {
   process.env.MODEL_API_URL = "https://ml-service.example";
+  process.env.MODEL_API_KEY = "test-model-api-key-which-is-long-enough-123456789";
 
   const invalidStudent = {
     ...validStudent,
@@ -114,6 +126,7 @@ test("predictBatch rejects extra ML input fields", async () => {
 
 test("predictBatch rejects missing ML input fields", async () => {
   process.env.MODEL_API_URL = "https://ml-service.example";
+  process.env.MODEL_API_KEY = "test-model-api-key-which-is-long-enough-123456789";
 
   const invalidStudent = {
     num_assessments_done: 2,
@@ -130,6 +143,7 @@ test("predictBatch rejects missing ML input fields", async () => {
 
 test("predictBatch rejects a mismatched prediction count", async () => {
   process.env.MODEL_API_URL = "https://ml-service.example";
+  process.env.MODEL_API_KEY = "test-model-api-key-which-is-long-enough-123456789";
 
   global.fetch = async () =>
     new Response(JSON.stringify([]), {
@@ -148,6 +162,7 @@ test("predictBatch rejects a mismatched prediction count", async () => {
 });
 
 test("predictBatch reports a missing MODEL_API_URL", async () => {
+  process.env.MODEL_API_KEY = "test-model-api-key-which-is-long-enough-123456789";
   delete process.env.MODEL_API_URL;
 
   await assert.rejects(
@@ -160,6 +175,7 @@ test("predictBatch reports a missing MODEL_API_URL", async () => {
 
 test("predictBatch rejects invalid prediction probabilities", async () => {
   process.env.MODEL_API_URL = "https://ml-service.example";
+  process.env.MODEL_API_KEY = "test-model-api-key-which-is-long-enough-123456789";
 
   global.fetch = async () =>
     new Response(
@@ -177,6 +193,56 @@ test("predictBatch rejects invalid prediction probabilities", async () => {
         },
       }
     );
+
+  await assert.rejects(
+    predictBatch([validStudent]),
+    (error) =>
+      error instanceof ModelServiceError &&
+      error.code === "MODEL_INVALID_RESPONSE"
+  );
+});
+
+
+test("predictBatch requires MODEL_API_KEY", async () => {
+  process.env.MODEL_API_URL = "https://ml-service.example";
+  delete process.env.MODEL_API_KEY;
+
+  await assert.rejects(
+    predictBatch([validStudent]),
+    (error) =>
+      error instanceof ModelServiceError &&
+      error.code === "MODEL_API_KEY_NOT_CONFIGURED"
+  );
+});
+
+test("predictBatch permits 91 course-relative active days (day 0 through day 90)", async () => {
+  process.env.MODEL_API_URL = "https://ml-service.example";
+  process.env.MODEL_API_KEY = "test-model-api-key-which-is-long-enough-123456789";
+  global.fetch = async () => new Response(JSON.stringify([validPrediction]), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  const result = await predictBatch([{
+    ...validStudent,
+    active_days: 91,
+  }]);
+
+  assert.equal(result.length, 1);
+});
+
+
+test("predictBatch rejects a risk label inconsistent with the documented threshold", async () => {
+  process.env.MODEL_API_URL = "https://ml-service.example";
+  process.env.MODEL_API_KEY = "test-model-api-key-which-is-long-enough-123456789";
+  global.fetch = async () => new Response(JSON.stringify([{
+    at_risk: true,
+    risk_probability: 0.2,
+    risk_level: "Low",
+  }]), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
 
   await assert.rejects(
     predictBatch([validStudent]),

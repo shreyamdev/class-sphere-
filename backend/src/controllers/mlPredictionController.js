@@ -1,8 +1,8 @@
-
+const mongoose = require("mongoose");
 const Classroom = require("../models/Classroom");
 const Assignment = require("../models/Assignment");
 const Submission = require("../models/Submission");
-
+const ActivityEvent = require("../models/ActivityEvent");
 const {
   predictBatch,
   ModelServiceError,
@@ -11,53 +11,67 @@ const {
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
 const MODEL_WINDOW_DAYS = 90;
 
-// Calculate the six features required by the new XGBoost model.
+/**
+ * Calculate the six features expected by the FastAPI/XGBoost service.
+ * Day 0 is courseStartDate. The observation window includes all of day 90,
+ * therefore its exclusive end is courseStartDate + 91 days.
+ */
 const calculateStudentMetrics = (
   assignments,
   studentSubmissions,
+  activityEvents,
   courseStartDate
 ) => {
   const courseStart = new Date(courseStartDate);
-  const day90End = new Date(
-    courseStart.getTime() + MODEL_WINDOW_DAYS * DAY_IN_MS
-  );
+  if (Number.isNaN(courseStart.getTime())) {
+    throw new TypeError("A valid courseStartDate is required.");
+  }
+
+  const windowStart = courseStart.getTime();
+  const windowEndExclusive = windowStart + (MODEL_WINDOW_DAYS + 1) * DAY_IN_MS;
 
   const assignmentMap = new Map(
-    assignments.map((assignment) => [
-      assignment._id.toString(),
-      assignment,
-    ])
+    assignments.map((assignment) => [String(assignment._id), assignment])
   );
 
-  const activeDays = new Set();
+  const activeDayBuckets = new Set();
   const scoredPercentages = [];
-
   let lateSubmissions = 0;
   let weightedScore = 0;
 
-  for (const submission of studentSubmissions) {
-    const submittedAt = new Date(submission.submittedAt);
-
-    // Only consider activity within the first 90 days.
+  // Count distinct course-relative activity days, not just submission days.
+  for (const event of activityEvents || []) {
+    const occurredAt = new Date(event.occurredAt).getTime();
     if (
-      Number.isNaN(submittedAt.getTime()) ||
-      submittedAt < courseStart ||
-      submittedAt > day90End
+      !Number.isFinite(occurredAt) ||
+      occurredAt < windowStart ||
+      occurredAt >= windowEndExclusive
     ) {
       continue;
     }
 
-    // Record the calendar day on which the student was active.
-    activeDays.add(
-      submittedAt.toISOString().slice(0, 10)
-    );
+    const courseDay = Math.floor((occurredAt - windowStart) / DAY_IN_MS);
+    activeDayBuckets.add(courseDay);
+  }
 
-    const assignmentId = submission.assignment.toString();
-    const assignment = assignmentMap.get(assignmentId);
+  for (const submission of studentSubmissions || []) {
+    const submittedAt = new Date(submission.submittedAt).getTime();
+    if (
+      !Number.isFinite(submittedAt) ||
+      submittedAt < windowStart ||
+      submittedAt >= windowEndExclusive
+    ) {
+      continue;
+    }
 
+    // Legacy and newly recorded assignment submissions are also activity.
+    // This keeps assignment engagement visible even for pre-event-log records.
+    const courseDay = Math.floor((submittedAt - windowStart) / DAY_IN_MS);
+    activeDayBuckets.add(courseDay);
+
+    const assignment = assignmentMap.get(String(submission.assignment));
     if (!assignment) continue;
 
-    // Only assessments with a score contribute to score metrics.
     if (
       submission.status !== "graded" ||
       submission.marksObtained === null ||
@@ -82,27 +96,20 @@ const calculateStudentMetrics = (
       continue;
     }
 
-    // Convert marks into percentage.
     const score = (marks / maxMarks) * 100;
-
     scoredPercentages.push(score);
-
-    // Required formula:
-    // weighted_score = sum(score * assessment weight / 100)
     weightedScore += (score * weight) / 100;
 
-    // Count only scored assessments submitted after their due date.
     if (
       assignment.dueDate &&
-      submittedAt > new Date(assignment.dueDate)
+      submittedAt > new Date(assignment.dueDate).getTime()
     ) {
-      lateSubmissions++;
+      lateSubmissions += 1;
     }
   }
 
   const numAssessmentsDone = scoredPercentages.length;
 
-  // No scored assessments: all five assessment metrics are zero.
   if (numAssessmentsDone === 0) {
     return {
       num_assessments_done: 0,
@@ -110,7 +117,7 @@ const calculateStudentMetrics = (
       min_score: 0,
       weighted_score: 0,
       late_submissions: 0,
-      active_days: activeDays.size,
+      active_days: activeDayBuckets.size,
     };
   }
 
@@ -118,33 +125,29 @@ const calculateStudentMetrics = (
     scoredPercentages.reduce((sum, score) => sum + score, 0) /
     numAssessmentsDone;
 
-  const minScore = Math.min(...scoredPercentages);
-
-  // Exactly six numeric fields expected by the Python API.
   return {
     num_assessments_done: numAssessmentsDone,
-    avg_score: Number(avgScore.toFixed(2)),
-    min_score: Number(minScore.toFixed(2)),
-    weighted_score: Number(weightedScore.toFixed(2)),
+    // Keep full calculated precision; the model guide does not specify
+    // rounding these input features before inference.
+    avg_score: avgScore,
+    min_score: Math.min(...scoredPercentages),
+    weighted_score: weightedScore,
     late_submissions: lateSubmissions,
-    active_days: activeDays.size,
+    active_days: activeDayBuckets.size,
   };
 };
 
-// GET /api/analytics/teacher/classrooms/:id/risk-predictions
 const getClassroomRiskPredictions = async (req, res) => {
   try {
     const { id: classroomId } = req.params;
 
-    // Check classroom ID.
-    if (!require("mongoose").isValidObjectId(classroomId)) {
+    if (!mongoose.isValidObjectId(classroomId)) {
       return res.status(400).json({
         success: false,
         message: "Invalid classroom ID.",
       });
     }
 
-    // Verify that the logged-in teacher owns this classroom.
     const classroom = await Classroom.findOne({
       _id: classroomId,
       teacher: req.user._id,
@@ -157,23 +160,28 @@ const getClassroomRiskPredictions = async (req, res) => {
       });
     }
 
-    const courseStartDate = new Date(classroom.createdAt);
+    // Backward-compatible fallback for classrooms created before migration.
+    const courseStartDate = new Date(
+      classroom.courseStartDate || classroom.createdAt
+    );
+    if (Number.isNaN(courseStartDate.getTime())) {
+      return res.status(422).json({
+        success: false,
+        code: "COURSE_START_DATE_INVALID",
+        message: "The classroom has no valid course start date.",
+      });
+    }
 
     const predictionEligibleFrom = new Date(
       courseStartDate.getTime() + MODEL_WINDOW_DAYS * DAY_IN_MS
     );
 
-    // The model must not be used before day 90.
-    if (new Date() < predictionEligibleFrom) {
+    if (Date.now() < predictionEligibleFrom.getTime()) {
       return res.status(409).json({
         success: false,
         code: "MODEL_WINDOW_NOT_REACHED",
-        message:
-          "Risk predictions are available only from day 90 of the course.",
-        data: {
-          courseStartDate,
-          predictionEligibleFrom,
-        },
+        message: "Risk predictions are available only from day 90 of the course.",
+        data: { courseStartDate, predictionEligibleFrom },
       });
     }
 
@@ -181,71 +189,71 @@ const getClassroomRiskPredictions = async (req, res) => {
       return res.status(200).json({
         success: true,
         data: {
-          classroom: {
-            id: classroom._id,
-            name: classroom.name,
-          },
+          classroom: { id: classroom._id, name: classroom.name },
           totalStudents: 0,
           predictedStudents: 0,
+          atRiskStudents: 0,
+          highRiskStudents: 0,
           students: [],
         },
       });
     }
 
-    // Fetch classroom assessments.
-    const assignments = await Assignment.find({
-      classroom: classroomId,
-    }).select("_id maxMarks weight dueDate");
+    const assignments = await Assignment.find({ classroom: classroomId })
+      .select("_id maxMarks weight dueDate")
+      .lean();
 
-    const assignmentIds = assignments.map(
-      (assignment) => assignment._id
+    const studentIds = classroom.students.map((student) => student._id);
+    const assignmentIds = assignments.map((assignment) => assignment._id);
+    const windowEndExclusive = new Date(
+      courseStartDate.getTime() + (MODEL_WINDOW_DAYS + 1) * DAY_IN_MS
     );
 
-    const studentIds = classroom.students.map(
-      (student) => student._id
-    );
+    const [submissions, activityEvents] = await Promise.all([
+      assignmentIds.length
+        ? Submission.find({
+            assignment: { $in: assignmentIds },
+            student: { $in: studentIds },
+            submittedAt: { $gte: courseStartDate, $lt: windowEndExclusive },
+          })
+            .select("student assignment status marksObtained submittedAt")
+            .lean()
+        : [],
+      ActivityEvent.find({
+        classroom: classroomId,
+        student: { $in: studentIds },
+        occurredAt: { $gte: courseStartDate, $lt: windowEndExclusive },
+      })
+        .select("student eventType occurredAt")
+        .lean(),
+    ]);
 
-    // Fetch submissions of all enrolled students.
-    const submissions = assignmentIds.length
-      ? await Submission.find({
-          assignment: { $in: assignmentIds },
-          student: { $in: studentIds },
-        }).select(
-          "student assignment status marksObtained submittedAt"
-        )
-      : [];
-
-    // Group submissions by student.
     const submissionsByStudent = new Map(
-      studentIds.map((id) => [id.toString(), []])
+      studentIds.map((studentId) => [String(studentId), []])
+    );
+    const activityByStudent = new Map(
+      studentIds.map((studentId) => [String(studentId), []])
     );
 
     for (const submission of submissions) {
-      const studentSubmissions = submissionsByStudent.get(
-        submission.student.toString()
-      );
-
-      if (studentSubmissions) {
-        studentSubmissions.push(submission);
-      }
+      submissionsByStudent.get(String(submission.student))?.push(submission);
+    }
+    for (const event of activityEvents) {
+      activityByStudent.get(String(event.student))?.push(event);
     }
 
-    // Prepare exactly six model inputs for every student.
     const studentsWithMetrics = classroom.students.map((student) => {
+      const key = String(student._id);
       const metrics = calculateStudentMetrics(
         assignments,
-        submissionsByStudent.get(student._id.toString()) || [],
+        submissionsByStudent.get(key) || [],
+        activityByStudent.get(key) || [],
         courseStartDate
       );
-
-      return {
-        student,
-        metrics,
-      };
+      return { student, metrics };
     });
 
-    let predictions = [];
-
+    let predictions;
     try {
       predictions = await predictBatch(
         studentsWithMetrics.map((item) => item.metrics)
@@ -258,72 +266,47 @@ const getClassroomRiskPredictions = async (req, res) => {
           message: error.message,
         });
       }
-
       throw error;
     }
 
-    // Match each prediction with the correct student.
     const students = studentsWithMetrics.map((item, index) => ({
       student: {
         id: item.student._id,
         name: item.student.name,
         email: item.student.email,
       },
-
-      status: "predicted",
-
       inputFeatures: item.metrics,
-
       prediction: predictions[index],
     }));
 
-    const highRiskStudents = students.filter(
-      (item) => item.prediction.risk_level === "High"
-    ).length;
-
-    const atRiskStudents = students.filter(
-      (item) => item.prediction.at_risk
-    ).length;
-
     return res.status(200).json({
       success: true,
-
       data: {
-        classroom: {
-          id: classroom._id,
-          name: classroom.name,
-        },
-
+        classroom: { id: classroom._id, name: classroom.name },
         model: {
           name: "XGBoost",
           target: "Fail or Withdrawn",
           observationWindowDays: 90,
+          day90Included: true,
           threshold: 0.35,
         },
-
         courseStartDate,
         predictionEligibleFrom,
-
         totalStudents: students.length,
         predictedStudents: predictions.length,
-        atRiskStudents,
-        highRiskStudents,
-
+        atRiskStudents: students.filter((item) => item.prediction.at_risk).length,
+        highRiskStudents: students.filter(
+          (item) => item.prediction.risk_level === "High"
+        ).length,
         students,
-
         disclaimer:
-          "Risk scores are model estimates for decision support only, not a diagnosis or guarantee. Do not use them as the sole basis for decisions affecting a student.",
-
+          "Risk scores are model estimates for teacher support, not diagnoses or guarantees. Do not use them as the sole basis for decisions affecting a student.",
         activityDataNote:
-          "active_days is calculated from distinct assignment submission dates. Other platform activities are not included because ClassSphere currently has no general activity log.",
+          "active_days counts distinct course-relative days with recorded student activity (assignment list/submission, quiz list/attempt, study-material list/download, or doubt creation/reply). Only events from day 0 through day 90 are included.",
       },
     });
   } catch (error) {
-    console.error(
-      "Classroom risk prediction error:",
-      error.message
-    );
-
+    console.error("Classroom risk prediction error:", error);
     return res.status(500).json({
       success: false,
       message: "Internal server error.",

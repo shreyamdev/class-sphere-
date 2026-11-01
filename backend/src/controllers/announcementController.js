@@ -1,6 +1,7 @@
 const Announcement = require("../models/Announcement");
 const Notification = require("../models/Notification");
 const Classroom = require("../models/Classroom");
+const { recordStudentActivity } = require("../services/activityTrackingService");
 
 //  Create announcement and notify enrolled students
 const createAnnouncement = async (req, res) => {
@@ -104,6 +105,12 @@ const getAnnouncements = async (req, res) => {
     })
       .populate("teacher", "name")
       .sort({ createdAt: -1 });
+
+    await recordStudentActivity({
+      user: req.user,
+      classroomId: classroom._id,
+      eventType: "announcement_list_view",
+    });
 
     return res.status(200).json({
       success: true,

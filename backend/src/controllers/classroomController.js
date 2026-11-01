@@ -8,9 +8,24 @@ const Notification = require("../models/Notification");
 const StudyMaterial = require("../models/StudyMaterial");
 const Quiz = require("../models/Quiz");
 const QuizAttempt = require("../models/QuizAttempt");
-const StudentRiskProfile = require("../models/StudentRiskProfile");
+const ActivityEvent = require("../models/ActivityEvent");
 const Doubt = require("../models/Doubt");
 const cloudinary = require("../config/cloudinary");
+const { recordStudentActivity } = require("../services/activityTrackingService");
+
+const deleteAuthenticatedRawAssets = async (publicIds) => {
+  const uniqueIds = [...new Set(publicIds.filter(Boolean))];
+  for (const publicId of uniqueIds) {
+    const result = await cloudinary.uploader.destroy(publicId, {
+      resource_type: "raw",
+      type: "authenticated",
+      invalidate: true,
+    });
+    if (result.result !== "ok" && result.result !== "not found") {
+      throw new Error(`Cloudinary could not delete asset ${publicId}`);
+    }
+  }
+};
 
 // Generate a six-character hexadecimal join code.
 const generateClassCode = () => {
@@ -25,6 +40,7 @@ const createClassroom = async (req, res) => {
       description = "",
       subject = "",
       semesterSection = "",
+      courseStartDate,
     } = req.body;
 
     if (typeof name !== "string" || name.trim().length < 3) {
@@ -72,6 +88,18 @@ const createClassroom = async (req, res) => {
       });
     }
 
+    const parsedCourseStartDate =
+      courseStartDate === undefined || courseStartDate === null || courseStartDate === ""
+        ? new Date()
+        : new Date(courseStartDate);
+
+    if (Number.isNaN(parsedCourseStartDate.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: "courseStartDate must be a valid date.",
+      });
+    }
+
     // Retry if a generated code already exists.
     let classroom = null;
 
@@ -84,6 +112,7 @@ const createClassroom = async (req, res) => {
           description: description.trim(),
           subject: subject.trim(),
           semesterSection: semesterSection.trim(),
+          courseStartDate: parsedCourseStartDate,
           classCode,
           teacher: req.user._id,
         });
@@ -263,6 +292,12 @@ const getClassroomById = async (req, res) => {
       });
     }
 
+    await recordStudentActivity({
+      user: req.user,
+      classroomId: classroom._id,
+      eventType: "classroom_view",
+    });
+
     return res.status(200).json({
       success: true,
       data: {
@@ -283,7 +318,7 @@ const getClassroomById = async (req, res) => {
 const updateClassroom = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, description, subject, semesterSection } = req.body;
+    const { name, description, subject, semesterSection, courseStartDate } = req.body;
 
     if (!mongoose.isValidObjectId(id)) {
       return res.status(400).json({
@@ -296,12 +331,13 @@ const updateClassroom = async (req, res) => {
       name === undefined &&
       description === undefined &&
       subject === undefined &&
-      semesterSection === undefined
+      semesterSection === undefined &&
+      courseStartDate === undefined
     ) {
       return res.status(400).json({
         success: false,
         message:
-          "Provide a name, description, subject or semester/section to update.",
+          "Provide a classroom field to update.",
       });
     }
 
@@ -350,6 +386,17 @@ const updateClassroom = async (req, res) => {
       });
     }
 
+    let parsedCourseStartDate;
+    if (courseStartDate !== undefined) {
+      parsedCourseStartDate = new Date(courseStartDate);
+      if (Number.isNaN(parsedCourseStartDate.getTime())) {
+        return res.status(400).json({
+          success: false,
+          message: "courseStartDate must be a valid date.",
+        });
+      }
+    }
+
     const classroom = await Classroom.findById(id);
 
     if (!classroom) {
@@ -380,6 +427,10 @@ const updateClassroom = async (req, res) => {
 
     if (semesterSection !== undefined) {
       classroom.semesterSection = semesterSection.trim();
+    }
+
+    if (parsedCourseStartDate !== undefined) {
+      classroom.courseStartDate = parsedCourseStartDate;
     }
 
     await classroom.save();
@@ -547,39 +598,28 @@ const deleteClassroom = async (req, res) => {
       });
     }
 
-    // Find assignments belonging to this classroom.
+    // Load dependent records before cleanup so every authenticated PDF can
+    // be removed from Cloudinary before its MongoDB reference is deleted.
     const assignments = await Assignment.find({
       classroom: classroom._id,
-    }).select("_id");
+    }).select("_id attachment.cloudinaryPublicId");
 
-    const assignmentIds = assignments.map(
-      (assignment) => assignment._id
-    );
+    const assignmentIds = assignments.map((assignment) => assignment._id);
 
-    // Find study materials before deleting their database records.
-    const materials = await StudyMaterial.find({
-      classroom: classroom._id,
-    });
+    const [materials, submissions] = await Promise.all([
+      StudyMaterial.find({ classroom: classroom._id }).select("cloudinaryPublicId"),
+      Submission.find({ assignment: { $in: assignmentIds } }).select(
+        "attachment.cloudinaryPublicId"
+      ),
+    ]);
 
-    // Delete authenticated PDFs from Cloudinary.
-    for (const material of materials) {
-      const cloudResult = await cloudinary.uploader.destroy(
-        material.cloudinaryPublicId,
-        {
-          resource_type: "raw",
-          type: "authenticated",
-        }
-      );
+    const cloudinaryPublicIds = [
+      ...materials.map((material) => material.cloudinaryPublicId),
+      ...assignments.map((assignment) => assignment.attachment?.cloudinaryPublicId),
+      ...submissions.map((submission) => submission.attachment?.cloudinaryPublicId),
+    ];
 
-      if (
-        cloudResult.result !== "ok" &&
-        cloudResult.result !== "not found"
-      ) {
-        throw new Error(
-          `Cloudinary could not delete material ${material._id}`
-        );
-      }
-    }
+    await deleteAuthenticatedRawAssets(cloudinaryPublicIds);
 
     // Remove dependent database records. Delete quiz attempts before quizzes
     // so classroom deletion cannot leave dangling quiz references.
@@ -588,7 +628,7 @@ const deleteClassroom = async (req, res) => {
 
     await QuizAttempt.deleteMany({ quiz: { $in: quizIds } });
     await Quiz.deleteMany({ classroom: classroom._id });
-    await StudentRiskProfile.deleteMany({ classroom: classroom._id });
+    await ActivityEvent.deleteMany({ classroom: classroom._id });
     await Doubt.deleteMany({ classroom: classroom._id });
 
     await Notification.deleteMany({

@@ -5,6 +5,7 @@ const { randomUUID } = require("crypto");
 const StudyMaterial = require("../models/StudyMaterial");
 const Classroom = require("../models/Classroom");
 const cloudinary = require("../config/cloudinary");
+const { recordStudentActivity } = require("../services/activityTrackingService");
 
 const isValidId = (id) => mongoose.isValidObjectId(id);
 
@@ -201,6 +202,12 @@ exports.getClassroomMaterials = async (req, res) => {
       downloadUrl: `/api/materials/${material._id}/download`,
     }));
 
+    await recordStudentActivity({
+      user: req.user,
+      classroomId,
+      eventType: "resource_list_view",
+    });
+
     return res.status(200).json({
       success: true,
       count: result.length,
@@ -275,6 +282,13 @@ exports.downloadStudyMaterial = async (req, res) => {
     const fileBuffer = Buffer.from(
       await fileResponse.arrayBuffer()
     );
+
+    await recordStudentActivity({
+      user: req.user,
+      classroomId: material.classroom,
+      eventType: "resource_download",
+      sourceId: material._id,
+    });
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Length", fileBuffer.length);

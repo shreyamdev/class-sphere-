@@ -118,3 +118,8 @@ This removes the Cloudinary file and the database record. If storage deletion fa
 `title`, `description`, `classroom`, `uploadedBy`, `cloudinaryPublicId`, `originalName`, `fileSize`, `mimeType`, `createdAt`, `updatedAt`. `cloudinaryPublicId` is unique and required.
 
 Browser note: use `FormData`; do not manually set the multipart `Content-Type` header because the browser needs to add its boundary.
+
+
+## ML activity tracking
+
+A successful student request to list classroom resources records `resource_list_view`; a successful student PDF download records `resource_download`. These timestamps contribute to the distinct first-90-day `active_days` metric. Teacher activity is not included.

@@ -2,6 +2,7 @@
 const mongoose = require("mongoose");
 const Doubt = require("../models/Doubt");
 const Classroom = require("../models/Classroom");
+const { recordStudentActivity } = require("../services/activityTrackingService");
 
 const isValidId = (id) => mongoose.isValidObjectId(id);
 
@@ -74,6 +75,14 @@ exports.createDoubt = async (req, res) => {
       description: description.trim(),
     });
 
+    await recordStudentActivity({
+      user: req.user,
+      classroomId,
+      eventType: "doubt_created",
+      sourceId: doubt._id,
+      occurredAt: doubt.createdAt,
+    });
+
     return res.status(201).json({ success: true, data: doubt });
   } catch (error) {
     console.error("createDoubt:", error);
@@ -98,6 +107,12 @@ exports.getClassroomDoubts = async (req, res) => {
         message: access.error,
       });
     }
+
+    await recordStudentActivity({
+      user: req.user,
+      classroomId,
+      eventType: "doubt_list_view",
+    });
 
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
@@ -180,6 +195,14 @@ exports.addReply = async (req, res) => {
     });
 
     await doubt.save();
+
+    await recordStudentActivity({
+      user: req.user,
+      classroomId: doubt.classroom,
+      eventType: "doubt_reply",
+      sourceId: doubt._id,
+      occurredAt: doubt.replies[doubt.replies.length - 1].createdAt || new Date(),
+    });
 
     return res.status(201).json({
       success: true,

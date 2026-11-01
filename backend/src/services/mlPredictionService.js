@@ -19,6 +19,22 @@ class ModelServiceError extends Error {
 
 const getModelBaseUrl = () => {
   const value = process.env.MODEL_API_URL;
+  const apiKey = process.env.MODEL_API_KEY;
+
+  if (!apiKey) {
+    throw new ModelServiceError(
+      "MODEL_API_KEY is not configured.",
+      "MODEL_API_KEY_NOT_CONFIGURED",
+      503
+    );
+  }
+  if (apiKey.length < 32) {
+    throw new ModelServiceError(
+      "MODEL_API_KEY must contain at least 32 characters.",
+      "MODEL_API_KEY_TOO_WEAK",
+      503
+    );
+  }
 
   if (!value) {
     throw new ModelServiceError(
@@ -135,9 +151,19 @@ const validateStudentInput = (student) => {
     );
   }
 
-  if (student.active_days > 90) {
+  // The PDF describes activity through day 90 inclusive. Depending on
+  // course-relative day boundaries, the observation window may contain 91
+  // distinct day numbers (day 0 through day 90), so do not cap at 90.
+
+  if (
+    student.num_assessments_done === 0 &&
+    (student.avg_score !== 0 ||
+      student.min_score !== 0 ||
+      student.weighted_score !== 0 ||
+      student.late_submissions !== 0)
+  ) {
     throw new ModelServiceError(
-      "active_days cannot exceed 90.",
+      "Assessment metrics must be zero when no scored assessments exist.",
       "MODEL_INVALID_INPUT",
       400
     );
@@ -162,6 +188,7 @@ const postJson = async (path, body) => {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
+          "X-Model-API-Key": process.env.MODEL_API_KEY,
         },
         body: JSON.stringify(body),
         signal: controller.signal,
@@ -242,18 +269,30 @@ const predictBatch = async (students) => {
   }
 
   for (const prediction of data) {
+    const probability = prediction?.risk_probability;
+    const expectedAtRisk =
+      typeof probability === "number" && probability >= 0.35;
+    const expectedRiskLevel =
+      typeof probability !== "number"
+        ? null
+        : probability < 0.35
+          ? "Low"
+          : probability < 0.65
+            ? "Medium"
+            : "High";
+
     if (
       typeof prediction?.at_risk !== "boolean" ||
-      typeof prediction?.risk_probability !== "number" ||
-      !Number.isFinite(prediction.risk_probability) ||
-      prediction.risk_probability < 0 ||
-      prediction.risk_probability > 1 ||
-      !["Low", "Medium", "High"].includes(
-        prediction?.risk_level
-      )
+      typeof probability !== "number" ||
+      !Number.isFinite(probability) ||
+      probability < 0 ||
+      probability > 1 ||
+      !["Low", "Medium", "High"].includes(prediction?.risk_level) ||
+      prediction.at_risk !== expectedAtRisk ||
+      prediction.risk_level !== expectedRiskLevel
     ) {
       throw new ModelServiceError(
-        "The ML service returned an invalid prediction result.",
+        "The ML service returned an invalid or threshold-inconsistent prediction result.",
         "MODEL_INVALID_RESPONSE",
         502
       );

@@ -14,6 +14,7 @@ const {
   getStudentQuizzes,
   submitQuiz,
   getMyQuizAttempts,
+  getQuizAttemptReview,
   getQuizResults,
 } = require("../controllers/quizController");
 
@@ -41,5 +42,13 @@ router.post("/:quizId/submit",protect,authorizeRoles("student"),submitQuiz);
 
 // Student: view their own attempt history.
 router.get("/student/attempts",protect,authorizeRoles("student"),getMyQuizAttempts);
+
+// Student: view their own marked answers and correct answers after submission.
+router.get(
+  "/student/attempts/:attemptId/review",
+  protect,
+  authorizeRoles("student"),
+  getQuizAttemptReview
+);
 
 module.exports = router;

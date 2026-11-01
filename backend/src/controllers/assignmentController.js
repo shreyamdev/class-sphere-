@@ -6,6 +6,7 @@ const Assignment = require("../models/Assignment");
 const Classroom = require("../models/Classroom");
 const Submission = require("../models/Submission");
 const cloudinary = require("../config/cloudinary");
+const { recordStudentActivity } = require("../services/activityTrackingService");
 
 const isValidId = (id) => mongoose.isValidObjectId(id);
 
@@ -152,6 +153,7 @@ const createAssignment = async (req, res) => {
 
     if (
       weight === null ||
+      (typeof weight !== "number" && typeof weight !== "string") ||
       (typeof weight === "string" && !weight.trim())
     ) {
       return res.status(400).json({
@@ -293,6 +295,12 @@ const getAssignments = async (req, res) => {
     })
       .populate("teacher", "name email")
       .sort({ dueDate: 1 });
+
+    await recordStudentActivity({
+      user: req.user,
+      classroomId,
+      eventType: "assignment_list_view",
+    });
 
     const result = assignments.map((assignment) => {
       const item = assignment.toObject();
@@ -564,6 +572,14 @@ const submitAssignment = async (req, res) => {
     submission.status = "submitted";
 
     await submission.save();
+
+    await recordStudentActivity({
+      user: req.user,
+      classroomId: assignment.classroom,
+      eventType: "assignment_submission",
+      sourceId: assignment._id,
+      occurredAt: submission.submittedAt,
+    });
 
     if (
       uploadedPublicId &&

@@ -1,75 +1,32 @@
-# ClassSphere Backend API Documentation
+# ClassSphere Backend Documentation
 
-**Version:** updated after the October 2026 backend changes  
-**Base URL (local):** `http://localhost:5000`  
-**Content type:** JSON unless an endpoint explicitly uses `multipart/form-data` or returns a PDF file.
+This folder documents the current Express/MongoDB backend and its separately deployed AI/ML integrations.
 
-> This documentation combines the existing `doc/` documentation with the routes/controllers/models in the latest available `class-sphere(2).zip` and the changes discussed in this chat: notification route mount, classroom `subject` and `semesterSection` fields, six-character class codes, and classroom-related cleanup on deletion. Confirm the changes are present in the running/deployed backend before treating them as live.
+## Feature guides
 
-## Start here
+- `Authentication.md` — registration, OTP, login, token lifecycle, and roles.
+- `Classroom-Management.md` — classroom creation, joining, editing, and deletion.
+- `Assignments-and-Grading.md` — assignments, authenticated PDFs, submissions, grading, and assessment weights.
+- `Study-Materials.md` — PDF uploads and downloads.
+- `AI-Features.md` — summarization, flashcards, and quiz generation integrations.
+- `ML-Performance-Insights.md` — six-feature day-90 XGBoost predictions and activity tracking.
+- `ML-Service-Security-Contract.md` — required API-key validation in the separate Python service.
+- `Quiz-Attempt-Review.md` — student review of selected answers against correct answers.
+- `Analytics.md` — student and teacher analytics.
+- `Announcements-and-Notifications.md` — classroom announcements and notifications.
+- `Doubt-Forum.md` — student questions and replies.
+- `Data-Schemas.md` — MongoDB model overview.
+- `API-Index.md` — API routes and roles.
+- `CHANGELOG-and-Testing.md` — current test and deployment checklist.
+- `Backend-Fix-Handoff.md` — migration and operational handoff.
 
-1. Register using `POST /api/auth/register`.
-2. Verify email with `POST /api/auth/verify-otp`.
-3. Log in using `POST /api/auth/login`, or use Google sign-in.
-4. For protected routes, send `Authorization: Bearer <ACCESS_TOKEN>`.
-5. Refresh access tokens using `POST /api/auth/refresh`. Replace **both** access and refresh tokens after a successful refresh because refresh-token rotation is enabled.
-6. A classroom is created by a `teacher`; students join using the six-character `classCode`.
+## Setup
 
-## Roles
+1. Install Node.js 18 or newer.
+2. Copy `.env.example` to `.env` and fill in real values.
+3. Run `npm ci`.
+4. Run `npm run migrate:ml-fields` once against the intended database to backfill `courseStartDate` and legacy assignment `weight` fields.
+5. Run `npm test`.
+6. Start locally with `npm run dev`.
 
-- `student`
-- `teacher`
-
-There is no `admin` role in the current User schema. The backend loads the user from the database on protected requests and checks the database role.
-
-## Documentation files
-
-- `Authentication.md` — register, OTP, login, Google auth, refresh, logout, current user.
-- `Classroom-Management.md` — create/list/join/update/delete classrooms and members.
-- `Assignments-and-Grading.md` — assignment creation, submissions, grading, and student submission lookup.
-- `Study-Materials.md` — PDF upload, list, download, update, delete.
-- `Announcements-and-Notifications.md` — announcements and in-app notifications.
-- `Analytics.md` — student and teacher analytics endpoints.
-- `ML-Performance-Insights.md` — teacher-only at-risk prediction APIs, required risk profile fields, model-service configuration, and data compatibility caveats.
-- `AI-Features.md` — authenticated PDF summarization/flashcards and teacher-only AI quiz generation APIs.
-- `Data-Schemas.md` — MongoDB/Mongoose schema reference and relationships.
-- `CHANGELOG-and-Testing.md` — changes in this documentation update and Postman checklist.
-
-## Common headers
-
-Protected JSON request:
-```http
-Authorization: Bearer <ACCESS_TOKEN>
-Content-Type: application/json
-```
-
-For PDF upload, use `multipart/form-data` and let Postman/browser generate the multipart boundary. For PDF download, the response is `application/pdf`, not JSON.
-
-## Common errors
-
-```json
-{
-  "success": false,
-  "message": "Invalid or expired access token."
-}
-```
-
-- `400` — invalid/missing input.
-- `401` — missing, invalid, or expired authentication token.
-- `403` — authenticated user lacks the required role or resource access.
-- `404` — resource not found or not accessible under the endpoint's checks.
-- `409` — duplicate account, duplicate membership, or similar conflict.
-- `413` — PDF upload exceeds 10 MB.
-- `429` — rate limit or OTP cooldown/attempt limit.
-- `500` — server-side failure.
-- `502` — external email/Cloudinary download service failure in relevant endpoints.
-
-## Important integration notes
-
-- IDs such as `CLASSROOM_ID`, `ASSIGNMENT_ID`, and `MATERIAL_ID` must be MongoDB ObjectId strings.
-- Do not send refresh tokens as bearer access tokens.
-- Never expose assignment/quiz answer keys or secrets to a student-facing response.
-- `MODEL_API_URL` must be configured on the Node.js backend service for ML prediction requests. See `ML-Performance-Insights.md`.
-- `AI_SERVICE_URL` and `QUIZ_SERVICE_URL` must be configured on the Node.js backend service for AI summarizer and quiz generation. See `AI-Features.md`.
-- A `GET /api/health` response confirms the API process responds; it does not prove MongoDB, email, Cloudinary, or ML model operations are all healthy.
-- Classroom deletion is destructive. Test it only on a disposable classroom and keep a backup. Database and Cloudinary deletion are not one atomic transaction.
+Never commit `.env`, service API keys, JWT secrets, or Cloudinary credentials.

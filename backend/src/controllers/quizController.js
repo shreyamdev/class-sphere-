@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const Quiz = require("../models/Quiz");
 const QuizAttempt = require("../models/QuizAttempt");
 const Classroom = require("../models/Classroom");
+const { recordStudentActivity } = require("../services/activityTrackingService");
 
 const getCorrectAnswer = (question) =>
   question.correctAnswer ??
@@ -36,6 +37,39 @@ const hideCorrectAnswers = (question) => {
   delete safeQuestion.correct_option;
 
   return safeQuestion;
+};
+
+const normalizeAnswer = (value) =>
+  String(value ?? "").trim().toLocaleLowerCase();
+
+// Build a review for a submitted attempt. This helper is only used after the
+// attempt is saved and only in student-owned attempt responses or teacher results.
+const buildAttemptReview = (quiz, attempt) => {
+  const answerMap = new Map(
+    (attempt.answers || []).map((answer) => [
+      answer.questionIndex,
+      answer.selectedAnswer,
+    ])
+  );
+
+  return quiz.questions.map((question, questionIndex) => {
+    const correctAnswer = getCorrectAnswer(question);
+    const selectedAnswer = answerMap.has(questionIndex)
+      ? answerMap.get(questionIndex)
+      : null;
+    const isCorrect =
+      selectedAnswer !== null &&
+      normalizeAnswer(selectedAnswer) === normalizeAnswer(correctAnswer);
+
+    return {
+      questionIndex,
+      question: hideCorrectAnswers(question),
+      selectedAnswer,
+      correctAnswer: String(correctAnswer ?? ""),
+      isCorrect,
+      status: selectedAnswer === null ? "unanswered" : isCorrect ? "correct" : "incorrect",
+    };
+  });
 };
 
 // TEACHER: Save a quiz as draft or published.
@@ -374,6 +408,12 @@ const getStudentQuizzes = async (req, res) => {
       quiz: { $in: quizzes.map((quiz) => quiz._id) },
     }).select("quiz score totalMarks submittedAt");
 
+    await recordStudentActivity({
+      user: req.user,
+      classroomId,
+      eventType: "quiz_list_view",
+    });
+
     const attemptMap = new Map(
       attempts.map((attempt) => [
         String(attempt.quiz),
@@ -535,6 +575,16 @@ const submitQuiz = async (req, res) => {
       totalQuestions,
     });
 
+    await recordStudentActivity({
+      user: req.user,
+      classroomId: quiz.classroom,
+      eventType: "quiz_attempt",
+      sourceId: quiz._id,
+      occurredAt: attempt.submittedAt,
+    });
+
+    const review = buildAttemptReview(quiz, attempt);
+
     return res.status(201).json({
       success: true,
       message: "Quiz submitted and graded successfully.",
@@ -546,6 +596,7 @@ const submitQuiz = async (req, res) => {
         correctAnswers: correctCount,
         totalQuestions,
         submittedAt: attempt.submittedAt,
+        review,
       },
     });
   } catch (error) {
@@ -565,26 +616,120 @@ const submitQuiz = async (req, res) => {
   }
 };
 
-// STUDENT: See their own quiz history.
+// STUDENT: See their own quiz history, including a marked-answer review.
 const getMyQuizAttempts = async (req, res) => {
   try {
     const attempts = await QuizAttempt.find({
       student: req.user._id,
     })
-      .populate("quiz", "title topic classroom totalMarks")
-      .sort({ submittedAt: -1 });
+      .sort({ submittedAt: -1 })
+      .lean();
+
+    const quizIds = [...new Set(attempts.map((attempt) => String(attempt.quiz)))];
+    const quizzes = quizIds.length
+      ? await Quiz.find({ _id: { $in: quizIds } })
+          .select("title topic classroom totalMarks questions")
+          .lean()
+      : [];
+    const quizMap = new Map(quizzes.map((quiz) => [String(quiz._id), quiz]));
+
+    const reviewedAttempts = attempts.map((attempt) => {
+      const quiz = quizMap.get(String(attempt.quiz));
+      if (!quiz) {
+        return {
+          ...attempt,
+          quiz: null,
+          review: [],
+          reviewAvailable: false,
+        };
+      }
+
+      return {
+        ...attempt,
+        quiz: {
+          _id: quiz._id,
+          title: quiz.title,
+          topic: quiz.topic,
+          classroom: quiz.classroom,
+          totalMarks: quiz.totalMarks,
+        },
+        review: buildAttemptReview(quiz, attempt),
+        reviewAvailable: true,
+      };
+    });
 
     return res.status(200).json({
       success: true,
-      count: attempts.length,
-      data: attempts,
+      count: reviewedAttempts.length,
+      data: reviewedAttempts,
     });
   } catch (error) {
     console.error("Get quiz history error:", error.message);
-
     return res.status(500).json({
       success: false,
       message: "Failed to fetch quiz history.",
+    });
+  }
+};
+
+// STUDENT: View the marked answers and correct answers for one own attempt.
+const getQuizAttemptReview = async (req, res) => {
+  try {
+    const { attemptId } = req.params;
+
+    if (!isValidId(attemptId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid quiz attempt ID.",
+      });
+    }
+
+    const attempt = await QuizAttempt.findOne({
+      _id: attemptId,
+      student: req.user._id,
+    }).lean();
+
+    if (!attempt) {
+      return res.status(404).json({
+        success: false,
+        message: "Quiz attempt not found.",
+      });
+    }
+
+    const quiz = await Quiz.findById(attempt.quiz)
+      .select("title topic classroom totalMarks questions")
+      .lean();
+
+    if (!quiz) {
+      return res.status(404).json({
+        success: false,
+        message: "The quiz associated with this attempt no longer exists.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        attemptId: attempt._id,
+        quiz: {
+          _id: quiz._id,
+          title: quiz.title,
+          topic: quiz.topic,
+          totalMarks: quiz.totalMarks,
+        },
+        score: attempt.score,
+        totalMarks: attempt.totalMarks,
+        correctAnswers: attempt.correctAnswers,
+        totalQuestions: attempt.totalQuestions,
+        submittedAt: attempt.submittedAt,
+        review: buildAttemptReview(quiz, attempt),
+      },
+    });
+  } catch (error) {
+    console.error("Get quiz attempt review error:", error.message);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch quiz attempt review.",
     });
   }
 };
@@ -658,5 +803,7 @@ module.exports = {
   getStudentQuizzes,
   submitQuiz,
   getMyQuizAttempts,
+  getQuizAttemptReview,
   getQuizResults,
+  buildAttemptReview,
 };
